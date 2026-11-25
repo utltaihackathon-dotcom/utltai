@@ -1,275 +1,302 @@
-"""
-UTLT.ai Assistant (Streamlit edition)
-A floating AI chat bubble pinned to the bottom-right of the page, plus a live
-LPG cylinder dashboard. Pure Python, no API keys.
+/*!
+ * UTLT.ai Assistant - drop-in floating AI widget (bottom-right) with a search bar.
+ * Pure JavaScript, no libraries, no API keys. Works on GitHub Pages.
+ * Uses Shadow DOM, so it will not clash with your site's CSS.
+ *
+ * Usage:  <script src="utlt-ai.js" defer></script>
+ *
+ * Optional config (put BEFORE the script tag):
+ *   <script>window.UTLT_AI = { esp32Url: "http://192.168.1.50/data" };</script>
+ *   ESP32 should return JSON like {"weight": 21.4, "burner": true}
+ *   (browsers block http:// calls from https:// pages - serve your ESP32 over https or run the page locally)
+ *
+ * Demo helpers in the console:  UTLT_AI_API.simulateLeak(true)  |  UTLT_AI_API.refill()
+ */
+(function () {
+  "use strict";
 
-Install:  pip install "streamlit>=1.39"
-Run:      streamlit run utlt_ai_streamlit.py
+  const cfg = Object.assign({
+    esp32Url: null,        // null = built-in simulator
+    tareKg: 15.3,          // empty cylinder weight
+    gasFullKg: 14.2,       // gas in a full cylinder
+    lowPct: 20,
+    emergency: "1906",     // India LPG emergency line - change for your region
+    tickMs: 1500,
+    hoursPerTick: 1 / 6,   // simulator: 1 tick = 10 simulated minutes
+    title: "UTLT.ai Assistant",
+    placeholder: "Ask UTLT.ai anything…",
+  }, window.UTLT_AI || {});
 
-Real hardware: set ESP32_URL to an endpoint returning {"weight": 21.4, "burner": true}
-"""
-import difflib
-import json
-import random
-import re
-import urllib.request
-from collections import deque
+  /* ---------------------------------------------------------------- sensor */
+  const sensor = {
+    t: 0, gas: cfg.gasFullKg * 0.62, burner: false, leak: false,
+    async read() {
+      this.t += cfg.hoursPerTick;
+      if (cfg.esp32Url) {
+        try {
+          const r = await fetch(cfg.esp32Url, { cache: "no-store" });
+          const d = await r.json();
+          this.gas = Math.max(0, Number(d.weight) - cfg.tareKg);
+          this.burner = !!d.burner;
+          return [this.t, this.gas, this.burner];
+        } catch (e) { /* board unreachable -> fall back to simulation */ }
+      }
+      if (Math.random() < 0.10) this.burner = !this.burner;
+      let use = this.burner ? (0.25 + Math.random() * 0.2) * cfg.hoursPerTick : 0;
+      if (this.leak) use += 0.04;
+      this.gas = Math.max(0, this.gas - use + (Math.random() - 0.5) * 0.006);
+      return [this.t, this.gas, this.burner];
+    },
+  };
 
-import pandas as pd
-import streamlit as st
+  /* ----------------------------------------------------------------- brain */
+  const pick = (a) => a[Math.floor(Math.random() * a.length)];
 
-# ------------------------------------------------------------------ config
-ESP32_URL = None            # e.g. "http://192.168.1.50/data"  (None = simulator)
-TARE_KG = 15.3              # empty cylinder weight
-GAS_FULL_KG = 14.2          # gas in a full cylinder
-LOW_GAS_PCT = 20
-EMERGENCY_NUMBER = "1906"   # India LPG emergency line - change for your region
-HOURS_PER_TICK = 1 / 6      # simulator: 1 tick = 10 simulated minutes
-TICK_SECONDS = 1.5
+  function lev(a, b) {
+    const m = a.length, n = b.length, d = Array.from({ length: m + 1 }, (_, i) => [i]);
+    for (let j = 1; j <= n; j++) d[0][j] = j;
+    for (let i = 1; i <= m; i++)
+      for (let j = 1; j <= n; j++)
+        d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    return d[m][n];
+  }
+  const sim = (a, b) => 1 - lev(a, b) / Math.max(a.length, b.length, 1);
 
-st.set_page_config(page_title="UTLT.ai", page_icon="🔥", layout="wide")
+  const INTENTS = {
+    level:  ["gas level", "how much gas", "remaining", "left", "percentage", "status", "cylinder", "full"],
+    days:   ["how long", "days", "last", "run out", "empty", "predict", "forecast", "when"],
+    leak:   ["leak", "smell", "safe", "safety", "danger", "gas smell", "check leak"],
+    weight: ["weight", "kg", "load cell", "hx711", "reading"],
+    book:   ["book", "order", "refill", "new cylinder", "buy"],
+    how:    ["how does", "work", "explain", "esp32", "project", "utlt", "about"],
+    tips:   ["tip", "tips", "save", "efficient", "reduce", "advice"],
+    help:   ["help", "what can you do", "commands", "options"],
+    hello:  ["hi", "hello", "hey", "yo", "good morning", "good evening"],
+    thanks: ["thanks", "thank you", "cool", "great", "nice"],
+  };
 
+  const brain = {
+    history: [], // [time_h, gas_kg, burner]
+    feed(t, g, b) { this.history.push([t, g, b]); if (this.history.length > 90) this.history.shift(); },
+    get gas() { const h = this.history[this.history.length - 1]; return h ? h[1] : 0; },
+    get pct() { return Math.max(0, Math.min(100, (this.gas / cfg.gasFullKg) * 100)); },
 
-# ------------------------------------------------------------------ sensor
-class Sensor:
-    def __init__(self):
-        self.t, self.gas = 0.0, GAS_FULL_KG * 0.62
-        self.burner, self.leak = False, False
+    burnRate() { // kg/hour: least-squares slope of gas vs time
+      const h = this.history, n = h.length;
+      if (n < 8) return null;
+      const mt = h.reduce((s, x) => s + x[0], 0) / n, mg = h.reduce((s, x) => s + x[1], 0) / n;
+      const den = h.reduce((s, x) => s + (x[0] - mt) ** 2, 0);
+      if (!den) return null;
+      return Math.max(0, -h.reduce((s, x) => s + (x[0] - mt) * (x[1] - mg), 0) / den);
+    },
+    daysLeft() { const r = this.burnRate(); return !r || r < 1e-4 ? null : this.gas / r / 24; },
+    leakSuspected() {
+      const h = this.history.slice(-4);
+      if (h.length < 4) return false;
+      const drops = [0, 1, 2].map((i) => h[i][1] - h[i + 1][1]);
+      return h.every((x) => !x[2]) && drops.every((d) => d > 0.02);
+    },
+    leakAlert() {
+      return "🚨 **LEAK SUSPECTED** - weight is dropping while the burner is off.\n" +
+        "1. No switches or flames\n2. Open doors and windows\n3. Close the regulator\n" +
+        `4. Leave and call **${cfg.emergency}**`;
+    },
 
-    def read(self):
-        self.t += HOURS_PER_TICK
-        if ESP32_URL:
-            try:
-                with urllib.request.urlopen(ESP32_URL, timeout=1.5) as r:
-                    d = json.loads(r.read().decode())
-                self.gas = max(0.0, float(d["weight"]) - TARE_KG)
-                self.burner = bool(d.get("burner", False))
-                return self.t, self.gas, self.burner
-            except Exception:
-                pass  # board unreachable -> fall back to simulation
-        if random.random() < 0.10:
-            self.burner = not self.burner
-        use = random.uniform(0.25, 0.45) * HOURS_PER_TICK if self.burner else 0
-        if self.leak:
-            use += 0.04
-        self.gas = max(0.0, self.gas - use + random.uniform(-0.003, 0.003))
-        return self.t, self.gas, self.burner
+    intent(text) {
+      text = text.toLowerCase();
+      const words = text.match(/[a-z']+/g) || [];
+      let best = null, bestScore = 0;
+      for (const [name, keys] of Object.entries(INTENTS)) {
+        let score = 0;
+        for (const k of keys) {
+          if (new RegExp("\\b" + k + "\\b").test(text)) score += 2 * k.split(" ").length;
+          else score += words.filter((w) => w.length > 3 && k.split(" ").some((kw) => sim(w, kw) >= 0.8)).length;
+        }
+        if (score > bestScore) { best = name; bestScore = score; }
+      }
+      return bestScore >= 1.5 || best === "hello" ? best : null;
+    },
 
+    reply(text) {
+      const i = this.intent(text), g = this.gas, p = this.pct;
+      switch (i) {
+        case "hello": return pick(["Hey! I'm watching your cylinder 24/7. Ask me anything.", "Hi there! Want a quick status check?"]);
+        case "level": return `**${g.toFixed(2)} kg** of gas left (**${p.toFixed(0)}%**) - ` + (p > cfg.lowPct ? "all good ✅" : "running low, time to reorder ⚠️");
+        case "days": {
+          const d = this.daysLeft(), r = this.burnRate();
+          if (d == null) return "Still learning your usage pattern - give me a few more readings.";
+          return `At your current usage (~${(r * 1000).toFixed(0)} g/hour) the gas lasts about **${d.toFixed(1)} days**. I'd reorder at around ${Math.max(1, d * 0.2).toFixed(1)} days left.`;
+        }
+        case "leak":
+          return this.leakSuspected() ? this.leakAlert()
+            : "No leak signature right now: weight is stable while the burner is off. If you ever smell gas, ventilate and close the regulator first - don't wait for software.";
+        case "weight": return `Total weight **${(g + cfg.tareKg).toFixed(2)} kg** (cylinder ${cfg.tareKg} kg + gas ${g.toFixed(2)} kg).`;
+        case "book": return "Booking isn't wired to a provider in this demo. Hook your distributor's API into `brain.reply` and I'll auto-order at 20%.";
+        case "how": return "**UTLT.ai:** 4 load cells → HX711 amplifier → ESP32 → dashboard. I turn raw weight into level, burn rate, forecasts and leak alerts.";
+        case "tips": return pick([
+          "Keep lids on pots - it can cut gas use by around 20%.",
+          "Soak dal and rice first; shorter cooking means less gas.",
+          "Flame tips should be blue. Yellow means poor burning - clean the burner.",
+          "Turn the regulator off at night - the best safety habit."]);
+        case "help": return "Try: *gas level*, *days left*, *check for leaks*, *weight*, *tips*, *how does this work*.";
+        case "thanks": return "Anytime! 🙌";
+      }
+      const keys = Object.values(INTENTS).flat();
+      let m = null, ms = 0.5;
+      for (const k of keys) { const s = sim(text.toLowerCase().trim(), k); if (s > ms) { ms = s; m = k; } }
+      return "I didn't quite get that." + (m ? ` Did you mean *${m}*?` : "") + " Type **help** for options.";
+    },
+  };
 
-# ------------------------------------------------------------------ brain
-class Brain:
-    INTENTS = {
-        "level": ["gas level", "how much gas", "remaining", "left", "percentage", "status", "cylinder", "full"],
-        "days": ["how long", "days", "last", "run out", "empty", "predict", "forecast", "when"],
-        "leak": ["leak", "smell", "safe", "safety", "danger", "gas smell", "check leak"],
-        "weight": ["weight", "kg", "load cell", "hx711", "reading"],
-        "book": ["book", "order", "refill", "new cylinder", "buy"],
-        "how": ["how does", "work", "explain", "esp32", "project", "utlt", "about"],
-        "tips": ["tip", "save", "efficient", "reduce", "advice"],
-        "help": ["help", "what can you do", "commands", "options"],
-        "hello": ["hi", "hello", "hey", "yo", "good morning", "good evening"],
-        "thanks": ["thanks", "thank you", "cool", "great", "nice"],
-    }
+  /* -------------------------------------------------------------------- UI */
+  const host = document.createElement("div");
+  host.id = "utlt-ai-root";
+  const root = host.attachShadow({ mode: "open" });
 
-    def __init__(self):
-        self.history = deque(maxlen=90)  # (time_h, gas_kg, burner_on)
+  root.innerHTML = `
+  <style>
+    :host { all: initial; }
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .wrap { position: fixed; right: 24px; bottom: 24px; z-index: 2147483000; color: #e8eefc; }
 
-    def feed(self, t, gas, burner):
-        self.history.append((t, gas, burner))
+    /* collapsed search pill */
+    .pill { display: flex; align-items: center; gap: 8px; width: 300px; max-width: calc(100vw - 32px);
+      background: #161d33; border: 1px solid #2a3556; border-radius: 999px; padding: 6px 6px 6px 14px;
+      box-shadow: 0 8px 28px rgba(0,0,0,.4); transition: border-color .2s, box-shadow .2s; }
+    .pill:focus-within { border-color: #3b82f6; box-shadow: 0 8px 28px rgba(59,130,246,.35); }
+    .pill input { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0; color: #e8eefc; font-size: 14px; }
+    .pill input::placeholder { color: #8b97b5; }
+    .go { position: relative; width: 38px; height: 38px; border-radius: 50%; border: 0; cursor: pointer;
+      background: #3b82f6; color: #fff; font-weight: 700; font-size: 13px; flex: none; }
+    .go.low  { background: #f59e0b; animation: pulse 1s infinite; --c: #f59e0b; }
+    .go.leak { background: #ef4444; animation: pulse 1s infinite; --c: #ef4444; }
+    @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c) 60%, transparent); }
+                       50% { box-shadow: 0 0 0 10px transparent; } }
 
-    @property
-    def gas(self):
-        return self.history[-1][1] if self.history else 0.0
+    /* chat panel */
+    .panel { display: none; flex-direction: column; width: 380px; max-width: calc(100vw - 32px); height: 520px;
+      max-height: calc(100vh - 48px); background: #0f1424; border: 1px solid #2a3556; border-radius: 18px;
+      overflow: hidden; box-shadow: 0 16px 48px rgba(0,0,0,.5); }
+    .open .panel { display: flex; animation: pop .18s ease-out; }
+    .open .pill { display: none; }
+    @keyframes pop { from { opacity: 0; transform: translateY(10px) scale(.98); } to { opacity: 1; transform: none; } }
+    header { display: flex; align-items: center; gap: 8px; padding: 12px 14px; background: #161d33; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #22c55e; }
+    header b { font-size: 14px; }
+    .st { font-size: 12px; color: #8b97b5; margin-left: 4px; }
+    .x { margin-left: auto; background: none; border: 0; color: #8b97b5; font-size: 16px; cursor: pointer; }
+    .msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .m { max-width: 85%; padding: 9px 12px; border-radius: 14px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
+    .bot { background: #1f2a44; border-bottom-left-radius: 4px; align-self: flex-start; }
+    .user { background: #3b82f6; color: #fff; border-bottom-right-radius: 4px; align-self: flex-end; }
+    .alert { background: #4a1d1d; color: #ffd7d7; align-self: flex-start; }
+    .typing { display: inline-flex; gap: 4px; }
+    .typing i { width: 6px; height: 6px; border-radius: 50%; background: #8b97b5; animation: bl 1s infinite; }
+    .typing i:nth-child(2) { animation-delay: .15s; } .typing i:nth-child(3) { animation-delay: .3s; }
+    @keyframes bl { 0%,80%,100% { opacity: .25; } 40% { opacity: 1; } }
+    .chips { display: flex; gap: 6px; padding: 0 12px 8px; flex-wrap: wrap; }
+    .chip { background: #161d33; color: #e8eefc; border: 1px solid #2a3556; border-radius: 999px;
+      padding: 4px 10px; font-size: 12px; cursor: pointer; }
+    .chip:hover { border-color: #3b82f6; }
+    form { display: flex; gap: 8px; padding: 10px 12px 12px; background: #0f1424; }
+    form input { flex: 1; background: #161d33; border: 1px solid #2a3556; border-radius: 999px; outline: 0;
+      color: #e8eefc; padding: 10px 14px; font-size: 14px; }
+    form input:focus { border-color: #3b82f6; }
+    form button { width: 40px; border-radius: 50%; border: 0; background: #3b82f6; color: #fff; cursor: pointer; font-size: 15px; }
+  </style>
 
-    @property
-    def pct(self):
-        return max(0.0, min(100.0, self.gas / GAS_FULL_KG * 100))
+  <div class="wrap" id="wrap">
+    <form class="pill" id="pill" autocomplete="off">
+      <input id="pillq" placeholder="${cfg.placeholder}" aria-label="Ask UTLT.ai" />
+      <button class="go" id="go" type="submit" aria-label="Ask">AI</button>
+    </form>
 
-    def burn_rate(self):
-        """kg/hour from least-squares slope of gas vs time."""
-        n = len(self.history)
-        if n < 8:
-            return None
-        ts, gs = [h[0] for h in self.history], [h[1] for h in self.history]
-        mt, mg = sum(ts) / n, sum(gs) / n
-        den = sum((x - mt) ** 2 for x in ts)
-        if den == 0:
-            return None
-        return max(0.0, -sum((x - mt) * (y - mg) for x, y in zip(ts, gs)) / den)
+    <section class="panel" role="dialog" aria-label="${cfg.title}">
+      <header>
+        <span class="dot" id="dot"></span><b>${cfg.title}</b><span class="st" id="st"></span>
+        <button class="x" id="x" aria-label="Close">✕</button>
+      </header>
+      <div class="msgs" id="msgs"></div>
+      <div class="chips" id="chips"></div>
+      <form id="form" autocomplete="off">
+        <input id="q" placeholder="${cfg.placeholder}" aria-label="Your question" />
+        <button type="submit" aria-label="Send">➤</button>
+      </form>
+    </section>
+  </div>`;
 
-    def days_left(self):
-        r = self.burn_rate()
-        return None if not r or r < 1e-4 else self.gas / r / 24
+  const $ = (id) => root.getElementById(id);
+  const wrap = $("wrap"), msgs = $("msgs"), go = $("go");
+  let alertState = null, alertedLeak = false, alertedLow = false;
 
-    def leak_suspected(self):
-        h = list(self.history)[-4:]
-        if len(h) < 4:
-            return False
-        drops = [h[i][1] - h[i + 1][1] for i in range(3)]
-        return all(not x[2] for x in h) and all(d > 0.02 for d in drops)
+  const fmt = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\*(.+?)\*/g, "<i>$1</i>")
+    .replace(/`(.+?)`/g, "<code>$1</code>").replace(/\n/g, "<br>");
 
-    def intent(self, text):
-        text = text.lower()
-        words = re.findall(r"[a-z']+", text)
-        best, best_score = None, 0.0
-        for name, keys in self.INTENTS.items():
-            score = 0.0
-            for k in keys:
-                if k in text:
-                    score += 2 * len(k.split())
-                else:
-                    score += sum(1 for w in words if len(w) > 3
-                                 and difflib.get_close_matches(w, k.split(), n=1, cutoff=0.8))
-            if score > best_score:
-                best, best_score = name, score
-        return best if best_score >= 1.5 or best == "hello" else None
+  function add(text, cls) {
+    const el = document.createElement("div");
+    el.className = "m " + cls;
+    el.innerHTML = fmt(text);
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+    return el;
+  }
 
-    def leak_alert(self):
-        return ("🚨 **LEAK SUSPECTED** - weight is dropping while the burner is off.\n\n"
-                "1. No switches or flames\n2. Open doors and windows\n3. Close the regulator\n"
-                f"4. Leave and call **{EMERGENCY_NUMBER}**")
+  function setOpen(v) {
+    wrap.classList.toggle("open", v);
+    if (v) { alertState = null; go.className = "go"; setTimeout(() => $("q").focus(), 0); }
+  }
 
-    def reply(self, text):
-        i, g, p = self.intent(text), self.gas, self.pct
-        if i == "hello":
-            return random.choice(["Hey! I'm watching your cylinder 24/7. Ask me anything.",
-                                  "Hi there! Want a quick status check?"])
-        if i == "level":
-            mood = "all good ✅" if p > LOW_GAS_PCT else "running low, time to reorder ⚠️"
-            return f"**{g:.2f} kg** of gas left (**{p:.0f}%**) - {mood}"
-        if i == "days":
-            d, r = self.days_left(), self.burn_rate()
-            if d is None:
-                return "Still learning your usage pattern - give me a few more readings."
-            return (f"At your current usage (~{r * 1000:.0f} g/hour) the gas lasts about **{d:.1f} days**. "
-                    f"I'd reorder at around {max(1, d * 0.2):.1f} days left.")
-        if i == "leak":
-            if self.leak_suspected():
-                return self.leak_alert()
-            return ("No leak signature right now: weight is stable while the burner is off. "
-                    "If you ever smell gas, ventilate and close the regulator first - don't wait for software.")
-        if i == "weight":
-            return f"Total weight **{g + TARE_KG:.2f} kg** (cylinder {TARE_KG} kg + gas {g:.2f} kg)."
-        if i == "book":
-            return ("Booking isn't wired to a provider in this demo. Hook your distributor's API "
-                    "into `Brain.reply` and I'll auto-order at 20%.")
-        if i == "how":
-            return ("**UTLT.ai:** 4 load cells -> HX711 amplifier -> ESP32 -> dashboard. "
-                    "I turn raw weight into level, burn rate, forecasts and leak alerts.")
-        if i == "tips":
-            return random.choice([
-                "Keep lids on pots - it can cut gas use by around 20%.",
-                "Soak dal and rice first; shorter cooking means less gas.",
-                "Flame tips should be blue. Yellow means poor burning - clean the burner.",
-                "Turn the regulator off at night - the best safety habit."])
-        if i == "help":
-            return "Try: *gas level*, *days left*, *check for leaks*, *weight*, *tips*, *how does this work*."
-        if i == "thanks":
-            return "Anytime! 🙌"
-        keys = [k for v in self.INTENTS.values() for k in v]
-        m = difflib.get_close_matches(text.lower(), keys, n=1, cutoff=0.5)
-        return "I didn't quite get that." + (f" Did you mean *{m[0]}*?" if m else "") + " Type **help** for options."
+  function ask(text) {
+    text = text.trim();
+    if (!text) return;
+    setOpen(true);
+    add(text, "user");
+    const t = add('<span class="typing"><i></i><i></i><i></i></span>', "bot");
+    t.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
+    setTimeout(() => { t.innerHTML = fmt(brain.reply(text)); msgs.scrollTop = msgs.scrollHeight; }, 400 + Math.random() * 400);
+  }
 
+  [["Gas level", "gas level"], ["Days left", "how many days left"], ["Leaks?", "check for leaks"], ["Tips", "tips"]]
+    .forEach(([label, q]) => {
+      const b = document.createElement("button");
+      b.className = "chip"; b.textContent = label; b.onclick = () => ask(q);
+      $("chips").appendChild(b);
+    });
 
-# ------------------------------------------------------------------ state
-ss = st.session_state
-if "sensor" not in ss:
-    ss.sensor, ss.brain = Sensor(), Brain()
-    ss.log = deque(maxlen=200)          # chart rows
-    ss.chat = [("assistant", "Hi! I'm the **UTLT.ai** assistant. I'm monitoring your cylinder live. Ask me anything.")]
-    ss.alert = None                     # "leak" | "low" | None (unread)
-    ss.alerted_leak = ss.alerted_low = False
-    for _ in range(12):                 # warm-up so predictions work immediately
-        ss.brain.feed(*ss.sensor.read())
+  $("pill").addEventListener("submit", (e) => { e.preventDefault(); const i = $("pillq"); const v = i.value; i.value = ""; v.trim() ? ask(v) : setOpen(true); });
+  $("form").addEventListener("submit", (e) => { e.preventDefault(); const i = $("q"); const v = i.value; i.value = ""; ask(v); });
+  $("x").onclick = () => setOpen(false);
+  host.addEventListener("keydown", (e) => { if (e.key === "Escape") setOpen(false); });
 
+  function raise(kind, text) {
+    alertState = kind;
+    add(text, "alert");
+    if (!wrap.classList.contains("open")) go.className = "go " + kind;
+  }
 
-def ask(text):
-    ss.chat.append(("user", text))
-    ss.chat.append(("assistant", ss.brain.reply(text)))
-    ss.alert = None
+  async function tick() {
+    brain.feed(...(await sensor.read()));
+    const p = brain.pct, leak = brain.leakSuspected();
+    $("st").textContent = `${p.toFixed(0)}% • ${brain.gas.toFixed(1)} kg`;
+    $("dot").style.background = leak ? "#ef4444" : p <= cfg.lowPct ? "#f59e0b" : "#22c55e";
+    if (leak && !alertedLeak) { alertedLeak = true; raise("leak", brain.leakAlert()); }
+    if (!leak) alertedLeak = false;
+    if (p <= cfg.lowPct && !alertedLow) { alertedLow = true; raise("low", `⚠️ Heads up: only **${p.toFixed(0)}%** gas left. Time to book a refill.`); }
+    if (p > cfg.lowPct + 5) alertedLow = false;
+  }
 
+  function start() {
+    document.body.appendChild(host);
+    add("Hi! I'm the **UTLT.ai** assistant. I'm monitoring your cylinder live. Ask me anything.", "bot");
+    (async () => { for (let i = 0; i < 12; i++) brain.feed(...(await sensor.read())); await tick(); setInterval(tick, cfg.tickMs); })();
+  }
 
-# ------------------------------------------------------------------ floating widget CSS
-pulse = {"leak": "#ef4444", "low": "#f59e0b"}.get(ss.alert, "#3b82f6")
-st.markdown(f"""
-<style>
-.st-key-ai_widget {{ position: fixed; bottom: 24px; right: 24px; z-index: 9999; width: auto; }}
-.st-key-ai_widget button {{
-    width: 64px; height: 64px; border-radius: 50%; border: none; color: white; font-weight: 700;
-    font-size: 18px; background: {pulse}; box-shadow: 0 6px 20px rgba(0,0,0,.35);
-    {"animation: utltpulse 1s infinite;" if ss.alert else ""}
-}}
-.st-key-ai_widget button:hover {{ transform: scale(1.06); }}
-@keyframes utltpulse {{ 0%,100% {{ box-shadow: 0 0 0 0 {pulse}99; }} 50% {{ box-shadow: 0 0 0 14px {pulse}00; }} }}
-div[data-testid="stPopoverBody"] {{ width: 390px; max-width: 92vw; border-radius: 16px; }}
-</style>
-""", unsafe_allow_html=True)
+  window.UTLT_AI_API = {
+    simulateLeak(v = true) { sensor.leak = !!v; },
+    refill() { sensor.gas = cfg.gasFullKg; alertedLow = false; },
+    ask,
+  };
 
-# ------------------------------------------------------------------ dashboard (live)
-st.title("🔥 UTLT.ai Smart LPG Monitor")
-
-
-@st.fragment(run_every=TICK_SECONDS)
-def dashboard():
-    brain, sensor = ss.brain, ss.sensor
-    t, gas, burner = sensor.read()
-    brain.feed(t, gas, burner)
-    ss.log.append({"time (h)": round(t, 2), "gas (kg)": round(gas, 3)})
-
-    leak, p = brain.leak_suspected(), brain.pct
-    if leak and not ss.alerted_leak:
-        ss.alerted_leak, ss.alert = True, "leak"
-        ss.chat.append(("assistant", brain.leak_alert()))
-        st.toast("Possible gas leak detected! Open the assistant.", icon="🚨")
-    if not leak:
-        ss.alerted_leak = False
-    if p <= LOW_GAS_PCT and not ss.alerted_low:
-        ss.alerted_low = True
-        ss.alert = ss.alert or "low"
-        ss.chat.append(("assistant", f"⚠️ Heads up: only **{p:.0f}%** gas left. Time to book a refill."))
-        st.toast(f"Only {p:.0f}% gas left", icon="⚠️")
-    if p > LOW_GAS_PCT + 5:
-        ss.alerted_low = False
-
-    d = brain.days_left()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Gas left", f"{brain.gas:.2f} kg", f"{p:.0f}%")
-    c2.metric("Total weight", f"{brain.gas + TARE_KG:.2f} kg")
-    c3.metric("Days left (forecast)", f"{d:.1f}" if d else "learning…")
-    c4.metric("Burner", "ON 🔥" if burner else "OFF")
-    st.progress(int(p) / 100, text="Cylinder level")
-    if leak:
-        st.error("Possible leak: weight is falling while the burner is off.")
-    st.line_chart(pd.DataFrame(ss.log), x="time (h)", y="gas (kg)", height=280)
-
-
-dashboard()
-
-with st.sidebar:
-    st.subheader("Demo controls")
-    ss.sensor.leak = st.toggle("Simulate a gas leak", value=ss.sensor.leak)
-    if st.button("Refill cylinder"):
-        ss.sensor.gas = GAS_FULL_KG
-        ss.alerted_low = False
-    st.caption("Using ESP32 at " + ESP32_URL if ESP32_URL else "Using built-in simulator.")
-
-# ------------------------------------------------------------------ floating chat bubble (bottom-right)
-with st.container(key="ai_widget"):
-    with st.popover("AI"):
-        st.markdown("**UTLT.ai Assistant**")
-        box = st.container(height=320)
-        with box:
-            for role, msg in ss.chat:
-                with st.chat_message(role):
-                    st.markdown(msg)
-        cols = st.columns(4)
-        for col, label in zip(cols, ["Level", "Days left", "Leaks?", "Tips"]):
-            if col.button(label, use_container_width=True, key=f"chip_{label}"):
-                ask({"Level": "gas level", "Days left": "how many days left",
-                     "Leaks?": "check for leaks", "Tips": "tips"}[label])
-                st.rerun()
-        with st.form("ask_form", clear_on_submit=True, border=False):
-            q = st.text_input("Ask me anything", label_visibility="collapsed", placeholder="Ask me anything…")
-            if st.form_submit_button("Send", use_container_width=True) and q.strip():
-                ask(q.strip())
-                st.rerun()
+  if (document.body) start(); else document.addEventListener("DOMContentLoaded", start);
+})();
