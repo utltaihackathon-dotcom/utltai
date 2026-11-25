@@ -353,14 +353,18 @@ INTENTS = {
     "how": ["how does", "work", "explain", "esp32", "project", "utlt", "about", "model", "accuracy"],
     "help": ["help", "what can you do", "commands", "options"],
     "hello": ["hi", "hello", "hey", "yo", "good morning", "good evening"],
-    "thanks": ["thanks", "thank you", "cool", "great", "nice"],
+    "thanks": ["thanks", "thank you", "thx", "ty", "appreciate it", "cool", "great", "nice", "awesome", "lit"],
+    "yes": ["yes", "yeah", "yep", "yup", "yea", "bet", "sure", "ok", "okay", "k", "alright", "fr", "for sure",
+            "go ahead", "do it", "sounds good", "please", "pls", "lets go", "let's go"],
+    "no": ["no", "nope", "nah", "not now", "no thanks", "skip", "pass"],
+    "bye": ["bye", "goodbye", "see you", "cya", "gtg", "good night"],
 }
 
 
 class Assistant:
     def __init__(self, readings=None, goal=DAILY_GOAL_L, demo_night_leak=False):
         self.goal, self.source = goal, "file" if readings else "demo"
-        self.lpg, self.fired = Lpg(), set()
+        self.lpg, self.fired, self.pending = Lpg(), set(), None
         self.readings = readings or make_demo(datetime.now(IST), night_leak=demo_night_leak)
         self.night_leak = demo_night_leak
         self.refresh()
@@ -414,19 +418,21 @@ class Assistant:
 
     # --- intent engine (typo tolerant)
     def intent(self, text):
-        text = text.lower()
-        words = re.findall(r"[a-z']+", text)
+        raw = text.lower()
+        variants = {raw, re.sub(r"(.)\1+", r"\1", raw)}  # "noooo" / "yesss" -> "no" / "yes"
         best, best_score = None, 0.0
-        for name, keys in INTENTS.items():
-            score = 0.0
-            for k in keys:
-                if re.search(r"\b" + re.escape(k) + r"(s|es)?\b", text):
-                    score += 2 * len(k.split())
-                else:
-                    score += sum(1 for w in words if len(w) > 3
-                                 and difflib.get_close_matches(w, k.split(), n=1, cutoff=0.8))
-            if score > best_score:
-                best, best_score = name, score
+        for text in variants:
+            words = re.findall(r"[a-z']+", text)
+            for name, keys in INTENTS.items():
+                score = 0.0
+                for k in keys:
+                    if re.search(r"\b" + re.escape(k) + r"(s|es)?\b", text):
+                        score += 2 * len(k.split())
+                    else:
+                        score += 1.5 * sum(1 for w in words if len(w) > 3
+                                     and difflib.get_close_matches(w, k.split(), n=1, cutoff=0.8))
+                if score > best_score:
+                    best, best_score = name, score
         return best if best_score >= 1.5 or best == "hello" else None
 
     # ============================================================ answers
@@ -641,12 +647,40 @@ class Assistant:
             s += f"\n\nBacktest: typical error ±{w.mae:.0f} L/day (~{w.accuracy:.0f}% accurate)."
         return s + f"\n\nData source: **{'your readings.json' if self.source == 'file' else 'built-in demo data'}** ({len(self.readings)} readings)."
 
+    OFFERS = {  # what I offer after each answer -> what "yes / bet" should trigger
+        "status": ("forecast", "Want me to predict the next 7 days?"),
+        "forecast": ("pattern", "Want to see the patterns behind that?"),
+        "pattern": ("tips", "Want tips to improve it?"),
+        "tips": ("anomaly", "Want me to check for leaks and spikes too?"),
+    }
+
+    def greeting(self):
+        self.pending = "forecast"
+        return self.status() + "\n\n" + self.OFFERS["status"][1]
+
     def reply(self, text):
         self.refresh()
         i = self.intent(text)
         t = text.lower()
+        if i == "yes":
+            i = self.pending or "status"
+        elif i == "no":
+            self.pending = None
+            return random.choice(["No worries! I'm here whenever you need me.", "All good - just ask when you're ready."])
+        elif i == "bye":
+            self.pending = None
+            return "See you! I'll keep watching your water and gas. 👋"
+        self.pending = None
+        out = self._answer(i, t)
+        if i in self.OFFERS:
+            self.pending, offer = self.OFFERS[i]
+            out += "\n\n" + offer
+        return out
+
+    def _answer(self, i, t):
         if i == "hello":
-            return random.choice(["Hey! I'm tracking your water and gas live. Ask me for a **status**.",
+            self.pending = "status"
+            return random.choice(["Hey! I'm tracking your water and gas live. Want a quick **status**?",
                                   "Hi there! Want a quick status check or a prediction?"])
         if i == "status":
             return self.status()
@@ -672,7 +706,8 @@ class Assistant:
             return self.a_how()
         if i == "help":
             return ("Try: *status*, *predict tomorrow*, *my patterns*, *am I over my goal*, *any leaks?*, "
-                    "*compare to last week*, *where is my water going*, *gas level*, *tips*.")
+                    "*compare to last week*, *where is my water going*, *gas level*, *tips*. "
+                    "You can also just say *bet* / *yes* when I offer something.")
         if i == "thanks":
             return "Anytime! 🙌"
         keys = [k for v in INTENTS.values() for k in v]
